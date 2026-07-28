@@ -99,6 +99,7 @@ class Keithley6221:
         self._filter_window = filter_window  # None = unset (device default), else 0-10 %
         self._display_on = display_on  # 2182A front-panel display; off is faster
         self._filter_count = max(2, int(filter_count))
+        self._host = host
         self.inst = None
         # Guards every access to self.inst: the GUI thread (mode switches,
         # settings changes) and the background logging thread (read_resistance)
@@ -107,13 +108,41 @@ class Keithley6221:
         self._lock = threading.RLock()
         if simulate:
             return
+        with self._lock:
+            self._open_session()
+            if self._mode == "delta":
+                self._setup_delta()
+            else:
+                self._setup_dc()
+
+    def _open_session(self):
+        """(Re)open the raw-socket VISA session to the 6221. Caller must hold
+        self._lock."""
         rm = pyvisa.ResourceManager()
         # Keithley 6221 raw socket on port 1394
-        self.inst = rm.open_resource(f"TCPIP0::{host}::1394::SOCKET")
+        self.inst = rm.open_resource(f"TCPIP0::{self._host}::1394::SOCKET",
+                                      open_timeout=5000)
         self.inst.timeout = 30000  # 30 s — delta mode can be slow
         self.inst.read_termination = "\n"
         self.inst.write_termination = "\n"
+
+    def reconnect(self):
+        """Recover from a dropped Ethernet connection (VI_ERROR_CONN_LOST /
+        VI_ERROR_TMO): close whatever is left of the old session, open a new
+        one, and reapply the currently-configured mode from scratch (delta
+        mode must be fully reconfigured and re-armed after a reset anyway).
+        Safe to call repeatedly -- used by the logging loop to self-heal
+        during long unattended runs instead of giving up on first error."""
+        if self.simulate:
+            return
         with self._lock:
+            if self.inst is not None:
+                try:
+                    self.inst.close()
+                except Exception:
+                    pass
+                self.inst = None
+            self._open_session()
             if self._mode == "delta":
                 self._setup_delta()
             else:
@@ -458,6 +487,8 @@ class Keithley2400SourceMeter:
         self._four_wire = four_wire
         self.inst = None
         self._output_on = False
+        self._resource = resource
+        self._baud = baud
         # Guards every access to self.inst, same reason as Keithley6221's
         # lock: the GUI thread (Apply/settings) and the background logging
         # thread (read_resistance) both touch the same serial port.
@@ -465,17 +496,39 @@ class Keithley2400SourceMeter:
         if simulate:
             self._output_on = True
             return
+        with self._lock:
+            self._open_serial()
+            self._setup()
+        self._output_on = True
+
+    def _open_serial(self):
+        """(Re)open the serial port. Caller must hold self._lock."""
         import serial as _serial
         self.inst = _serial.Serial(
-            port=resource, baudrate=baud, bytesize=8,
+            port=self._resource, baudrate=self._baud, bytesize=8,
             parity="N", stopbits=1, timeout=5,
             dsrdtr=False, rtscts=False, xonxoff=False,
         )
         time.sleep(0.1)
         self.inst.reset_input_buffer()
+
+    def reconnect(self):
+        """Recover from a dropped/reset serial connection: close whatever is
+        left of the old port, reopen it, and reapply settings from scratch.
+        Safe to call repeatedly -- used by the logging loop to self-heal
+        during long unattended runs instead of giving up on first error."""
+        if self.simulate:
+            return
         with self._lock:
+            if self.inst is not None:
+                try:
+                    self.inst.close()
+                except Exception:
+                    pass
+                self.inst = None
+            self._open_serial()
             self._setup()
-        self._output_on = True
+            self._write(f":OUTP {'ON' if self._output_on else 'OFF'}")
 
     def _write(self, cmd):
         self.inst.write((cmd + "\n").encode())
@@ -614,16 +667,36 @@ class Cryocon22C:
         self.simulate = simulate
         self.channel = channel.strip().upper()
         self.inst = None
+        self._resource = resource
+        self._baud = baud
         if simulate:
             return
+        self._open_serial()
+
+    def _open_serial(self):
         import serial as _serial
         self.inst = _serial.Serial(
-            port=resource, baudrate=baud, bytesize=8,
+            port=self._resource, baudrate=self._baud, bytesize=8,
             parity="N", stopbits=1, timeout=5,
             dsrdtr=False, rtscts=False, xonxoff=False,
         )
         time.sleep(0.1)
         self.inst.reset_input_buffer()
+
+    def reconnect(self):
+        """Recover from a dropped/reset serial connection: close whatever is
+        left of the old port and reopen it. Safe to call repeatedly -- used
+        by the logging loop to self-heal during long unattended runs instead
+        of giving up on first error."""
+        if self.simulate:
+            return
+        if self.inst is not None:
+            try:
+                self.inst.close()
+            except Exception:
+                pass
+            self.inst = None
+        self._open_serial()
 
     def _query(self, cmd):
         self.inst.write((cmd + "\n").encode())
@@ -1355,15 +1428,45 @@ class LoggerApp:
 
     # ------------------------------------------------------ background loop
     def _log_loop(self):
-        """Runs in a background thread; instruments are only touched here."""
+        """Runs in a background thread; instruments are only touched here.
+
+        Connection drops (VI_ERROR_CONN_LOST, VI_ERROR_TMO, dropped serial
+        ports, etc.) are treated as recoverable: reconnect with a capped
+        exponential backoff and keep going, rather than ending the session.
+        Unattended runs here span days, and a single network blip or router
+        hiccup shouldn't require someone to notice, power-cycle the
+        instrument, and manually restart logging.
+        """
+        consecutive_failures = 0
         while not self.stop_event.is_set():
             loop_start = time.time()
             try:
                 temp = self.cryocon.read_temperature()
+            except Exception as e:
+                consecutive_failures += 1
+                self.data_queue.put(("warn",
+                    f"Cryo-con read failed ({e}); reconnecting (attempt {consecutive_failures})..."))
+                try:
+                    self.cryocon.reconnect()
+                except Exception:
+                    pass
+                self._wait_backoff(consecutive_failures)
+                continue
+            try:
                 res = self.keithley.read_resistance()
             except Exception as e:
-                self.data_queue.put(("error", str(e)))
-                break
+                consecutive_failures += 1
+                self.data_queue.put(("warn",
+                    f"Keithley read failed ({e}); reconnecting (attempt {consecutive_failures})..."))
+                try:
+                    self.keithley.reconnect()
+                except Exception:
+                    pass
+                self._wait_backoff(consecutive_failures)
+                continue
+            if consecutive_failures:
+                self.data_queue.put(("info", "Reconnected — logging resumed."))
+            consecutive_failures = 0
             now = datetime.now()
             elapsed = time.time() - self.start_time
             row = [now.strftime("%Y-%m-%d %H:%M:%S"), f"{temp:.4f}", f"{res:.6e}"]
@@ -1383,6 +1486,16 @@ class LoggerApp:
             while not self.stop_event.is_set() and time.time() - loop_start < interval:
                 time.sleep(0.1)
 
+    def _wait_backoff(self, consecutive_failures):
+        """Sleep with capped exponential backoff between reconnect attempts
+        (1, 2, 4, 8, 16, 30, 30, ... s), checking stop_event frequently so
+        Stop/Disconnect stay responsive during a prolonged outage."""
+        backoff = min(30.0, 2.0 ** min(consecutive_failures, 5))
+        waited = 0.0
+        while not self.stop_event.is_set() and waited < backoff:
+            time.sleep(0.2)
+            waited += 0.2
+
     # ------------------------------------------------------------ GUI update
     def _poll_queue(self):
         try:
@@ -1391,6 +1504,8 @@ class LoggerApp:
                 if msg[0] == "error":
                     self.status_var.set(f"ERROR: {msg[1]} — logging stopped.")
                     self.stop_logging()
+                elif msg[0] in ("warn", "info"):
+                    self.status_var.set(msg[1])
                 else:
                     _, now, elapsed, temp, res = msg
                     self.time_lbl["text"] = now.strftime("%H:%M:%S")
