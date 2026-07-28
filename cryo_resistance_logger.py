@@ -142,6 +142,11 @@ class Keithley6221:
                 except Exception:
                     pass
                 self.inst = None
+            # The 6221's embedded network stack only accepts one client on
+            # port 1394 at a time and can take a couple of seconds to notice
+            # the old connection is gone; reopening immediately after close()
+            # risks a refused/timed-out connection attempt. Give it a moment.
+            time.sleep(2.0)
             self._open_session()
             if self._mode == "delta":
                 self._setup_delta()
@@ -243,9 +248,12 @@ class Keithley6221:
         # CAB OFF: skip RS-232 calibration fetch from 2182A (avoids abort if
         # the serial link between instruments isn't fully configured yet)
         self.inst.write("SOUR:DELT:CAB OFF")
-        # Arm once — each INIT:IMM re-triggers without needing to re-arm
+        # Arm once — each INIT:IMM re-triggers without needing to re-arm.
+        # Arming triggers RS-232 handshaking/trigger-link sync between the
+        # 6221 and 2182A; give that a full second rather than 0.2s so the
+        # first INIT:IMM doesn't race ahead of it.
         self.inst.write("SOUR:DELT:ARM")
-        time.sleep(0.2)
+        time.sleep(1.0)
 
     def _setup_dc(self):
         """Configure a plain single-polarity DC current output and read the
@@ -358,7 +366,7 @@ class Keithley6221:
                     self._set_2182a_display(display_on)
                 self.inst.write("SOUR:DELT:CAB OFF")
                 self.inst.write("SOUR:DELT:ARM")
-                time.sleep(0.2)
+                time.sleep(1.0)
             else:
                 if compliance is not None:
                     self._compliance = compliance
@@ -403,6 +411,24 @@ class Keithley6221:
         with self._lock:
             return self.inst.query("*IDN?").strip()
 
+    def is_alive(self):
+        """Lightweight liveness probe used before deciding a read failure
+        needs a full reconnect(): flush stale socket bytes, clear SCPI
+        status, and confirm *IDN? still responds. If this succeeds, the
+        socket itself is fine -- the failure was a transient parsing/timing
+        glitch (e.g. a stale byte from a slow *OPC?), not a dropped
+        connection, so the caller can just retry instead of tearing down
+        and re-arming the whole delta-mode session."""
+        if self.simulate:
+            return True
+        try:
+            with self._lock:
+                self._flush()
+                self.inst.write("*CLS")
+                return bool(self.inst.query("*IDN?").strip())
+        except Exception:
+            return False
+
     def read_resistance(self):
         if self.simulate:
             return 100.0 + 5.0 * math.sin(time.time() / 30.0) + random.gauss(0, 0.05)
@@ -433,7 +459,7 @@ class Keithley6221:
             self._flush()
             self.inst.write("*CLS")
             self.inst.write("SOUR:DELT:ARM")
-            time.sleep(0.2)
+            time.sleep(1.0)
             raise
 
     def _read_resistance_dc(self):
@@ -443,8 +469,20 @@ class Keithley6221:
         cancellation, unlike delta mode."""
         self.inst.write('SYST:COMM:SER:SEND ":SENS:DATA:FRESH?"')
         time.sleep(max(self._nplc / 60.0, 0.02) + 0.05)
-        raw = self.inst.query("SYST:COMM:SER:ENT?").strip()
-        voltage = float(raw)
+        voltage = None
+        for attempt in range(2):
+            raw = self.inst.query("SYST:COMM:SER:ENT?").strip()
+            try:
+                voltage = float(raw)
+                break
+            except ValueError:
+                if attempt == 0:
+                    # The 2182A hadn't finished replying over the RS-232
+                    # pass-through yet -- a known timing race, not a dropped
+                    # connection. Wait a beat and ask again before giving up.
+                    time.sleep(0.1)
+        if voltage is None:
+            return float("nan")  # persistently empty/corrupted reply
         if abs(voltage) >= OVERFLOW_THRESHOLD:
             return float("nan")  # compliance tripped, or sensor over-range
         if self._delta_current == 0:
@@ -596,6 +634,17 @@ class Keithley2400SourceMeter:
         with self._lock:
             return self._query("*IDN?")
 
+    def is_alive(self):
+        """Lightweight liveness probe, see Keithley6221.is_alive()."""
+        if self.simulate:
+            return True
+        try:
+            with self._lock:
+                self.inst.reset_input_buffer()
+                return bool(self._query("*IDN?"))
+        except Exception:
+            return False
+
     def read_resistance(self):
         if self.simulate:
             return 100.0 + 5.0 * math.sin(time.time() / 30.0) + random.gauss(0, 0.05)
@@ -706,6 +755,16 @@ class Cryocon22C:
         if self.simulate:
             return "SIMULATED Cryo-con 22C"
         return self._query("*IDN?")
+
+    def is_alive(self):
+        """Lightweight liveness probe, see Keithley6221.is_alive()."""
+        if self.simulate:
+            return True
+        try:
+            self.inst.reset_input_buffer()
+            return bool(self._query("*IDN?"))
+        except Exception:
+            return False
 
     def read_temperature(self):
         if self.simulate:
@@ -1478,12 +1537,21 @@ class LoggerApp:
     def _log_loop(self):
         """Runs in a background thread; instruments are only touched here.
 
-        Connection drops (VI_ERROR_CONN_LOST, VI_ERROR_TMO, dropped serial
-        ports, etc.) are treated as recoverable: reconnect with a capped
-        exponential backoff and keep going, rather than ending the session.
-        Unattended runs here span days, and a single network blip or router
-        hiccup shouldn't require someone to notice, power-cycle the
-        instrument, and manually restart logging.
+        A read failure doesn't necessarily mean the connection is dead -- a
+        stale byte left over from a slow query, or a one-off SCPI timing
+        glitch, raises the same kind of exception as a real dropped socket
+        but is fully recoverable in-band (flush + *CLS) without touching the
+        connection at all. Tearing down and reopening the session for every
+        such glitch is itself what was destabilizing things: closing a raw
+        socket to the 6221 and immediately reopening it can get refused
+        while the instrument's old connection is still winding down.
+
+        So a failure is only treated as a real disconnect -- and only then
+        does it reconnect with a capped exponential backoff -- if is_alive()
+        also confirms the connection is actually gone. Unattended runs here
+        span days, and a single network blip or router hiccup shouldn't
+        require someone to notice, power-cycle the instrument, and manually
+        restart logging.
         """
         consecutive_failures = 0
         while not self.stop_event.is_set():
@@ -1491,9 +1559,13 @@ class LoggerApp:
             try:
                 temp = self.cryocon.read_temperature()
             except Exception as e:
+                if self.cryocon.is_alive():
+                    self.data_queue.put(("warn", f"Cryo-con read glitch ({e}); retrying..."))
+                    self._interruptible_sleep(1.0)
+                    continue
                 consecutive_failures += 1
                 self.data_queue.put(("warn",
-                    f"Cryo-con read failed ({e}); reconnecting (attempt {consecutive_failures})..."))
+                    f"Cryo-con connection lost ({e}); reconnecting (attempt {consecutive_failures})..."))
                 try:
                     self.cryocon.reconnect()
                 except Exception:
@@ -1503,9 +1575,13 @@ class LoggerApp:
             try:
                 res = self.keithley.read_resistance()
             except Exception as e:
+                if self.keithley.is_alive():
+                    self.data_queue.put(("warn", f"Keithley read glitch ({e}); retrying..."))
+                    self._interruptible_sleep(1.0)
+                    continue
                 consecutive_failures += 1
                 self.data_queue.put(("warn",
-                    f"Keithley read failed ({e}); reconnecting (attempt {consecutive_failures})..."))
+                    f"Keithley connection lost ({e}); reconnecting (attempt {consecutive_failures})..."))
                 try:
                     self.keithley.reconnect()
                 except Exception:
@@ -1536,11 +1612,15 @@ class LoggerApp:
 
     def _wait_backoff(self, consecutive_failures):
         """Sleep with capped exponential backoff between reconnect attempts
-        (1, 2, 4, 8, 16, 30, 30, ... s), checking stop_event frequently so
-        Stop/Disconnect stay responsive during a prolonged outage."""
+        (1, 2, 4, 8, 16, 30, 30, ... s)."""
         backoff = min(30.0, 2.0 ** min(consecutive_failures, 5))
+        self._interruptible_sleep(backoff)
+
+    def _interruptible_sleep(self, seconds):
+        """Sleep in small chunks, checking stop_event frequently so
+        Stop/Disconnect stay responsive during a prolonged outage."""
         waited = 0.0
-        while not self.stop_event.is_set() and waited < backoff:
+        while not self.stop_event.is_set() and waited < seconds:
             time.sleep(0.2)
             waited += 0.2
 
