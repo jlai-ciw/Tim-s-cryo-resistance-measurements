@@ -28,6 +28,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.ticker import ScalarFormatter
 
 try:
     import pyvisa
@@ -63,6 +64,16 @@ NANOVOLTMETER_RANGES = {
     "100 V": 100.0,
 }
 
+# 2182A digital averaging-filter type (:SENS:VOLT:AVER:TCON). Moving average
+# continuously slides a window of N readings; repeating average waits for a
+# full fresh window each cycle so a filtered value never blends pre- and
+# post-transition readings; Off disables the filter entirely.
+FILTER_TYPES = {
+    "Moving Average": "MOV",
+    "Repeating Average": "REP",
+    "Off": "OFF",
+}
+
 # Sentinel for update_delta_settings' voltage_range kwarg: unlike this
 # function's other kwargs (where None means "leave unchanged"), None is a
 # valid target value here (it means "switch to autorange").
@@ -74,7 +85,7 @@ class Keithley6221:
 
     def __init__(self, host, delta_current=1e-3, delay=0.002, count=1,
                  nplc=1.0, compliance=10.0, mode="delta", voltage_range=None,
-                 filter_on=False, filter_count=10,
+                 filter_type="MOV", filter_window=None, filter_count=10,
                  simulate=False):
         self.simulate = simulate
         self._delta_current = delta_current
@@ -84,7 +95,8 @@ class Keithley6221:
         self._compliance = compliance
         self._mode = mode  # "delta" or "dc"
         self._voltage_range = voltage_range  # None = autorange; else fixed volts
-        self._filter_on = filter_on
+        self._filter_type = filter_type  # "MOV", "REP", or "OFF"
+        self._filter_window = filter_window  # None = unset (device default), else 0-10 %
         self._filter_count = max(2, int(filter_count))
         self.inst = None
         # Guards every access to self.inst: the GUI thread (mode switches,
@@ -119,12 +131,15 @@ class Keithley6221:
             cmds.append(":SENS:VOLT:CHAN1:RANG:AUTO OFF")
             cmds.append(f":SENS:VOLT:CHAN1:RANG {self._voltage_range:.6e}")
         cmds.append(f":SENS:VOLT:NPLC {self._nplc:.3g}")
-        # Digital averaging filter: repeating-average of N readings before a
-        # value is reported. TCON REP (vs MOV) waits for a full window of
-        # fresh readings each time rather than continuously sliding, so a
-        # filtered value never blends pre- and post-transition readings.
-        if self._filter_on:
-            cmds.append(":SENS:VOLT:AVER:TCON REP")
+        # Digital averaging filter: MOV (moving average) continuously slides
+        # a window of N readings; REP (repeating average) waits for a full
+        # fresh window each time, so a filtered value never blends pre- and
+        # post-transition readings. Must be configured before delta mode is
+        # armed -- this runs ahead of SOUR:DELT:ARM in _setup_delta.
+        if self._filter_type != "OFF":
+            cmds.append(f":SENS:VOLT:AVER:TCON {self._filter_type}")
+            if self._filter_window is not None:
+                cmds.append(f":SENS:VOLT:AVER:WIND {self._filter_window:.6g}")
             cmds.append(f":SENS:VOLT:AVER:COUN {self._filter_count}")
             cmds.append(":SENS:VOLT:AVER:STAT ON")
         else:
@@ -150,12 +165,17 @@ class Keithley6221:
             self.inst.write(f'SYST:COMM:SER:SEND ":SENS:VOLT:CHAN1:RANG {voltage_range:.6e}"')
         time.sleep(0.1)
 
-    def _set_2182a_filter(self, filter_on, filter_count):
+    def _set_2182a_filter(self, filter_type, filter_window, filter_count):
         """Push new digital averaging-filter settings to an already-connected
-        2182A (state + count). Used for live updates outside full setup."""
-        if filter_on:
-            self.inst.write('SYST:COMM:SER:SEND ":SENS:VOLT:AVER:TCON REP"')
+        2182A (type + window + count). Used for live updates outside full
+        setup. Caller must send this before re-arming delta mode (SOUR:DELT:
+        ARM) -- update_delta_settings only re-arms after calling this."""
+        if filter_type != "OFF":
+            self.inst.write(f'SYST:COMM:SER:SEND ":SENS:VOLT:AVER:TCON {filter_type}"')
             time.sleep(0.1)
+            if filter_window is not None:
+                self.inst.write(f'SYST:COMM:SER:SEND ":SENS:VOLT:AVER:WIND {filter_window:.6g}"')
+                time.sleep(0.1)
             self.inst.write(f'SYST:COMM:SER:SEND ":SENS:VOLT:AVER:COUN {filter_count}"')
             time.sleep(0.1)
             self.inst.write('SYST:COMM:SER:SEND ":SENS:VOLT:AVER:STAT ON"')
@@ -230,7 +250,7 @@ class Keithley6221:
 
     def update_delta_settings(self, delta_current=None, delay=None, count=None,
                                nplc=None, compliance=None, voltage_range=_UNSET,
-                               filter_on=None, filter_count=None):
+                               filter_type=None, filter_window=_UNSET, filter_count=None):
         """Push new source/measurement parameters to an already-connected
         instrument, in whichever mode (delta or DC) is currently active.
 
@@ -250,8 +270,10 @@ class Keithley6221:
                 self._compliance = compliance
             if voltage_range is not _UNSET:
                 self._voltage_range = voltage_range
-            if filter_on is not None:
-                self._filter_on = filter_on
+            if filter_type is not None:
+                self._filter_type = filter_type
+            if filter_window is not _UNSET:
+                self._filter_window = filter_window
             if filter_count is not None:
                 self._filter_count = max(2, int(filter_count))
             return
@@ -280,12 +302,16 @@ class Keithley6221:
                 if voltage_range is not _UNSET:
                     self._voltage_range = voltage_range
                     self._set_2182a_range(voltage_range)
-                if filter_on is not None or filter_count is not None:
-                    if filter_on is not None:
-                        self._filter_on = filter_on
+                if filter_type is not None or filter_window is not _UNSET or filter_count is not None:
+                    if filter_type is not None:
+                        self._filter_type = filter_type
+                    if filter_window is not _UNSET:
+                        self._filter_window = filter_window
                     if filter_count is not None:
                         self._filter_count = max(2, int(filter_count))
-                    self._set_2182a_filter(self._filter_on, self._filter_count)
+                    # Must happen before re-arming below (SOUR:DELT:ARM) --
+                    # filter settings are locked in once delta mode is armed.
+                    self._set_2182a_filter(self._filter_type, self._filter_window, self._filter_count)
                 self.inst.write("SOUR:DELT:CAB OFF")
                 self.inst.write("SOUR:DELT:ARM")
                 time.sleep(0.2)
@@ -304,12 +330,14 @@ class Keithley6221:
                 if voltage_range is not _UNSET:
                     self._voltage_range = voltage_range
                     self._set_2182a_range(voltage_range)
-                if filter_on is not None or filter_count is not None:
-                    if filter_on is not None:
-                        self._filter_on = filter_on
+                if filter_type is not None or filter_window is not _UNSET or filter_count is not None:
+                    if filter_type is not None:
+                        self._filter_type = filter_type
+                    if filter_window is not _UNSET:
+                        self._filter_window = filter_window
                     if filter_count is not None:
                         self._filter_count = max(2, int(filter_count))
-                    self._set_2182a_filter(self._filter_on, self._filter_count)
+                    self._set_2182a_filter(self._filter_type, self._filter_window, self._filter_count)
 
     def _flush(self):
         """Drain any unread bytes left in the socket receive buffer."""
@@ -753,16 +781,6 @@ class LoggerApp:
         ttk.Label(kdelta, text="power line cycles (2182A integration time)").grid(
                   row=4, column=2, sticky="w")
 
-        ttk.Label(kdelta, text="Rate presets:").grid(row=5, column=0, sticky="e", **pad)
-        ratef = ttk.Frame(kdelta)
-        ratef.grid(row=5, column=1, columnspan=2, sticky="w", **pad)
-        ttk.Button(ratef, text="Fast (0.1)",
-                   command=lambda: self.delta_nplc_var.set("0.1")).pack(side="left", padx=2)
-        ttk.Button(ratef, text="Medium (1)",
-                   command=lambda: self.delta_nplc_var.set("1.0")).pack(side="left", padx=2)
-        ttk.Button(ratef, text="Slow (5, lowest noise)",
-                   command=lambda: self.delta_nplc_var.set("5.0")).pack(side="left", padx=2)
-
         ttk.Label(kdelta, text="Compliance voltage:").grid(row=6, column=0, sticky="e", **pad)
         self.compliance_var = tk.StringVar(value="10.0")
         ttk.Entry(kdelta, textvariable=self.compliance_var, width=8).grid(
@@ -777,20 +795,32 @@ class LoggerApp:
         ttk.Label(kdelta, text="(2182A ch.1; fix if autorange overflows)").grid(
                   row=7, column=2, sticky="w")
 
-        self.k6221_filter_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(kdelta, text="Enable averaging filter",
-                        variable=self.k6221_filter_var).grid(row=8, column=0,
-                                                              sticky="w", **pad)
-        self.k6221_filter_count_var = tk.StringVar(value="10")
-        ttk.Entry(kdelta, textvariable=self.k6221_filter_count_var, width=8).grid(
-                  row=8, column=1, **pad)
-        ttk.Label(kdelta, text="readings averaged (2182A, 2-100)").grid(
+        ttk.Label(kdelta, text="Filter type:").grid(row=8, column=0, sticky="e", **pad)
+        self.filter_type_var = tk.StringVar(value="Moving Average")
+        ttk.Combobox(kdelta, textvariable=self.filter_type_var,
+                     values=list(FILTER_TYPES.keys()), width=16,
+                     state="readonly").grid(row=8, column=1, sticky="w", **pad)
+        ttk.Label(kdelta, text="2182A digital averaging filter").grid(
                   row=8, column=2, sticky="w")
+
+        ttk.Label(kdelta, text="Filter window:").grid(row=9, column=0, sticky="e", **pad)
+        self.filter_window_var = tk.StringVar(value="None")
+        ttk.Entry(kdelta, textvariable=self.filter_window_var, width=8).grid(
+                  row=9, column=1, **pad)
+        ttk.Label(kdelta, text="% of range, 0-10, or None (2182A default)").grid(
+                  row=9, column=2, sticky="w")
+
+        ttk.Label(kdelta, text="Filter count:").grid(row=10, column=0, sticky="e", **pad)
+        self.filter_count_var = tk.StringVar(value="10")
+        ttk.Entry(kdelta, textvariable=self.filter_count_var, width=8).grid(
+                  row=10, column=1, **pad)
+        ttk.Label(kdelta, text="readings averaged (2-100)").grid(
+                  row=10, column=2, sticky="w")
 
         self.apply_delta_btn = ttk.Button(kdelta, text="Apply to instrument",
                                           command=self.apply_delta_settings,
                                           state="disabled")
-        self.apply_delta_btn.grid(row=9, column=0, columnspan=3, **pad)
+        self.apply_delta_btn.grid(row=11, column=0, columnspan=3, **pad)
 
         # --- Keithley 2400 source settings ---
         k2400 = ttk.LabelFrame(conn, text="Keithley 2400 — Source Settings")
@@ -875,6 +905,40 @@ class LoggerApp:
         ttk.Radiobutton(scalef, text="Log", value="log", variable=self.res_scale_var,
                         command=self._on_scale_change).pack(side="left")
 
+        # --- Axis range frame ---
+        rng = ttk.LabelFrame(left, text="Axis ranges")
+        rng.pack(fill="x", **pad)
+
+        self.temp_auto_var = tk.BooleanVar(value=True)
+        self.temp_min_var = tk.StringVar(value="")
+        self.temp_max_var = tk.StringVar(value="")
+        self.res_auto_var = tk.BooleanVar(value=True)
+        self.res_min_var = tk.StringVar(value="")
+        self.res_max_var = tk.StringVar(value="")
+        self.time_auto_var = tk.BooleanVar(value=True)
+        self.time_min_var = tk.StringVar(value="")
+        self.time_max_var = tk.StringVar(value="")
+
+        def _range_row(row, label, auto_var, min_var, max_var):
+            ttk.Label(rng, text=label).grid(row=row, column=0, sticky="e", **pad)
+            ttk.Checkbutton(rng, text="Auto", variable=auto_var,
+                             command=self._redraw).grid(row=row, column=1, sticky="w")
+            f = ttk.Frame(rng)
+            f.grid(row=row, column=2, sticky="w", **pad)
+            e_min = ttk.Entry(f, textvariable=min_var, width=8)
+            e_min.pack(side="left")
+            ttk.Label(f, text=" to ").pack(side="left")
+            e_max = ttk.Entry(f, textvariable=max_var, width=8)
+            e_max.pack(side="left")
+            e_min.bind("<Return>", lambda e: self._redraw())
+            e_max.bind("<Return>", lambda e: self._redraw())
+
+        _range_row(0, "Temperature (K):", self.temp_auto_var, self.temp_min_var, self.temp_max_var)
+        _range_row(1, "Resistance (Ω):", self.res_auto_var, self.res_min_var, self.res_max_var)
+        _range_row(2, "Elapsed time (min):", self.time_auto_var, self.time_min_var, self.time_max_var)
+        ttk.Button(rng, text="Apply ranges", command=self._redraw).grid(
+            row=3, column=0, columnspan=3, **pad)
+
         # --- Current readings frame ---
         cur = ttk.LabelFrame(left, text="Current reading")
         cur.pack(fill="x", **pad)
@@ -906,6 +970,8 @@ class LoggerApp:
         self.ax_rt.set_title("R vs T")
         self.rt_line, = self.ax_rt.plot([], [], "g.-", ms=3, lw=0.8)
         self.ax_rt.grid(True, alpha=0.3)
+        self._plain_format(self.ax_rt.xaxis)
+        self._plain_format(self.ax_rt.yaxis)
         self.fig_rt.tight_layout()
         self.canvas_rt = FigureCanvasTkAgg(self.fig_rt, master=right)
         self.canvas_rt.get_tk_widget().pack(fill="both", expand=True)
@@ -921,6 +987,9 @@ class LoggerApp:
         self.res_line, = self.ax_res.plot([], [], "r.-", ms=3, lw=0.8)
         self.ax_temp.grid(True, alpha=0.3)
         self.ax_res.grid(True, alpha=0.3)
+        self._plain_format(self.ax_temp.yaxis)
+        self._plain_format(self.ax_res.yaxis)
+        self._plain_format(self.ax_res.xaxis)
         self.fig.tight_layout()
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -972,6 +1041,15 @@ class LoggerApp:
             self.k2400_conn.grid(row=1, column=0, columnspan=3, sticky="ew", **pad)
             self.k2400_settings.grid(row=6, column=0, columnspan=3, sticky="ew", **pad)
 
+    @staticmethod
+    def _parse_filter_window(text):
+        """Parse the filter-window field: blank/"None" means unset (leave the
+        2182A at its own default); otherwise a 0-10 percent value."""
+        text = text.strip()
+        if not text or text.lower() == "none":
+            return None
+        return float(text)
+
     def connect(self):
         source = self.source_var.get()
         baud = int(self.baud_var.get())
@@ -982,7 +1060,8 @@ class LoggerApp:
                 delta_count = int(self.delta_count_var.get())
                 delta_nplc = float(self.delta_nplc_var.get())
                 compliance = float(self.compliance_var.get())
-                filter_count = int(self.k6221_filter_count_var.get())
+                filter_window = self._parse_filter_window(self.filter_window_var.get())
+                filter_count = int(self.filter_count_var.get())
             else:
                 k2400_current = float(self.k2400_current_var.get()) * 1e-3  # mA → A
                 k2400_compliance = float(self.k2400_compliance_var.get())
@@ -1000,7 +1079,8 @@ class LoggerApp:
                                              compliance=compliance,
                                              mode=self.mode_var.get(),
                                              voltage_range=NANOVOLTMETER_RANGES[self.k6221_range_var.get()],
-                                             filter_on=self.k6221_filter_var.get(),
+                                             filter_type=FILTER_TYPES[self.filter_type_var.get()],
+                                             filter_window=filter_window,
                                              filter_count=filter_count,
                                              simulate=self.simulate_keithley_var.get())
                 k_id = self.keithley.identify()
@@ -1065,18 +1145,19 @@ class LoggerApp:
             delta_count = int(self.delta_count_var.get())
             delta_nplc = float(self.delta_nplc_var.get())
             compliance = float(self.compliance_var.get())
-            filter_count = int(self.k6221_filter_count_var.get())
+            filter_window = self._parse_filter_window(self.filter_window_var.get())
+            filter_count = int(self.filter_count_var.get())
         except ValueError:
             messagebox.showerror("Bad value", "Delta mode parameters must be numbers.")
             return
         voltage_range = NANOVOLTMETER_RANGES[self.k6221_range_var.get()]
-        filter_on = self.k6221_filter_var.get()
+        filter_type = FILTER_TYPES[self.filter_type_var.get()]
         try:
             self.keithley.update_delta_settings(
                 delta_current=delta_current, delay=delta_delay,
                 count=delta_count, nplc=delta_nplc, compliance=compliance,
-                voltage_range=voltage_range, filter_on=filter_on,
-                filter_count=filter_count)
+                voltage_range=voltage_range, filter_type=filter_type,
+                filter_window=filter_window, filter_count=filter_count)
         except Exception as e:
             messagebox.showerror("Apply failed", str(e))
             self.status_var.set(f"Failed to apply delta settings: {e}")
@@ -1085,7 +1166,7 @@ class LoggerApp:
             f"Applied: {delta_current*1e3:.3f} mA, {compliance:.2f} V compliance, "
             f"{delta_delay*1e3:.2f} ms delay, {delta_count} readings, NPLC {delta_nplc:.3g}, "
             f"range {self.k6221_range_var.get()}, "
-            f"filter {'ON' if filter_on else 'OFF'} ({filter_count})")
+            f"filter {self.filter_type_var.get()} ({filter_count}, window={filter_window})")
 
     def apply_k2400_settings(self):
         if self.keithley is None:
@@ -1210,6 +1291,14 @@ class LoggerApp:
         self._redraw()
         self.count_lbl["text"] = "0"
 
+    @staticmethod
+    def _plain_format(axis):
+        """Force plain (non-scientific, no offset) tick labels, e.g. 150000
+        instead of 1.5e5 / a "1e5" offset box in the corner."""
+        fmt = ScalarFormatter(useOffset=False)
+        fmt.set_scientific(False)
+        axis.set_major_formatter(fmt)
+
     def _on_scale_change(self):
         """Switch the resistance axes (R-vs-T and the time-series R plot)
         between linear and log scale. Useful for superconducting transitions,
@@ -1219,7 +1308,23 @@ class LoggerApp:
         scale = self.res_scale_var.get()
         self.ax_rt.set_yscale(scale)
         self.ax_res.set_yscale(scale)
+        if scale == "linear":
+            # set_yscale resets the formatter, so plain formatting must be
+            # re-applied; log scale keeps matplotlib's own power-of-ten labels.
+            self._plain_format(self.ax_rt.yaxis)
+            self._plain_format(self.ax_res.yaxis)
         self._redraw()
+
+    @staticmethod
+    def _parse_range(min_var, max_var):
+        try:
+            lo = float(min_var.get())
+            hi = float(max_var.get())
+        except ValueError:
+            return None
+        if lo >= hi:
+            return None
+        return lo, hi
 
     # ------------------------------------------------------ background loop
     def _log_loop(self):
@@ -1292,10 +1397,33 @@ class LoggerApp:
         for ax in (self.ax_temp, self.ax_res):
             ax.relim()
             ax.autoscale_view()
+
+        if not self.time_auto_var.get():
+            r = self._parse_range(self.time_min_var, self.time_max_var)
+            if r:
+                self.ax_res.set_xlim(*r)  # shared x-axis with ax_temp
+        if not self.temp_auto_var.get():
+            r = self._parse_range(self.temp_min_var, self.temp_max_var)
+            if r:
+                self.ax_temp.set_ylim(*r)
+        if not self.res_auto_var.get():
+            r = self._parse_range(self.res_min_var, self.res_max_var)
+            if r:
+                self.ax_res.set_ylim(*r)
         self.canvas.draw_idle()
+
         self.rt_line.set_data(self.temp_hist, self.res_hist)
         self.ax_rt.relim()
         self.ax_rt.autoscale_view()
+
+        if not self.temp_auto_var.get():
+            r = self._parse_range(self.temp_min_var, self.temp_max_var)
+            if r:
+                self.ax_rt.set_xlim(*r)
+        if not self.res_auto_var.get():
+            r = self._parse_range(self.res_min_var, self.res_max_var)
+            if r:
+                self.ax_rt.set_ylim(*r)
         self.canvas_rt.draw_idle()
 
     def on_close(self):
