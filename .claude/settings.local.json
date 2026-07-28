@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python -c \"import pyvisa; rm = pyvisa.ResourceManager\\(\\); print\\(rm\\); print\\(rm.list_resources\\(\\)\\)\")",
+      "PowerShell($p = Start-Process python -ArgumentList '\"C:\\\\Users\\\\jlai\\\\.claude\\\\projects\\\\Tim''s cryo resistance measurements\\\\cryo_resistance_logger.py\"' -PassThru -RedirectStandardError \"$env:TEMP\\\\cryolog_err.txt\"; Start-Sleep -Seconds 6; if \\($p.HasExited\\) { \"EXITED code $\\($p.ExitCode\\)\"; Get-Content \"$env:TEMP\\\\cryolog_err.txt\" } else { \"GUI running OK\"; Stop-Process -Id $p.Id -Force })"
+    ]
+  }
+}
