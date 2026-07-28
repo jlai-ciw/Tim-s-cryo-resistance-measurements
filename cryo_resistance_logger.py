@@ -733,6 +733,9 @@ class Cryocon22C:
 
 MAX_PLOT_POINTS = 5000  # cap in-memory/plotted history; full data always still goes to the CSV
 
+RATE_WINDOW_MIN = 2.0  # minutes of recent history used for the displayed
+                        # cooling-rate estimate (display-only, never logged)
+
 
 class LoggerApp:
     def __init__(self, root):
@@ -762,12 +765,54 @@ class LoggerApp:
     def _build_gui(self):
         pad = {"padx": 5, "pady": 3}
 
-        left = ttk.Frame(self.root)
-        left.grid(row=0, column=0, sticky="ns", **pad)
+        # Size the window to fit comfortably on a 1920x1080 display (leaving
+        # room for the taskbar/title bar) rather than letting Tk size it to
+        # the natural (taller-than-the-screen) height of every control panel
+        # stacked up -- the left column is scrollable below as a second line
+        # of defense for smaller/other displays.
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = min(1700, screen_w - 60)
+        win_h = min(950, screen_h - 120)
+        self.root.geometry(f"{win_w}x{win_h}")
+
+        left_container = ttk.Frame(self.root)
+        left_container.grid(row=0, column=0, sticky="ns", **pad)
         right = ttk.Frame(self.root)
         right.grid(row=0, column=1, sticky="nsew", **pad)
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
+
+        # The left column of controls is taller than a 1080p screen can show
+        # all at once, so it lives in a scrollable canvas -- everything below
+        # the fold (Current reading, status, etc.) stays reachable by
+        # scrolling instead of being cut off with no way to see it.
+        left_canvas = tk.Canvas(left_container, highlightthickness=0)
+        left_scroll = ttk.Scrollbar(left_container, orient="vertical",
+                                     command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_canvas.grid(row=0, column=0, sticky="ns")
+        left_scroll.grid(row=0, column=1, sticky="ns")
+        left_container.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(left_canvas)
+        left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _sync_scrollregion(event=None):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+            # Keep the canvas exactly as wide as its content so it doesn't
+            # clip (or leave dead space) horizontally, only scrolls vertically.
+            left_canvas.configure(width=left.winfo_reqwidth())
+        left.bind("<Configure>", _sync_scrollregion)
+
+        def _on_mousewheel(event):
+            left_canvas.yview_scroll(-int(event.delta / 120), "units")
+        def _bind_mousewheel(_event):
+            left_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        def _unbind_mousewheel(_event):
+            left_canvas.unbind_all("<MouseWheel>")
+        left_canvas.bind("<Enter>", _bind_mousewheel)
+        left_canvas.bind("<Leave>", _unbind_mousewheel)
 
         # --- Instrument connection frame ---
         conn = ttk.LabelFrame(left, text="Instruments")
@@ -866,7 +911,7 @@ class LoggerApp:
         ttk.Label(kdelta, text="(averaged, Delta mode only)").grid(row=3, column=2, sticky="w")
 
         ttk.Label(kdelta, text="Rate (NPLC):").grid(row=4, column=0, sticky="e", **pad)
-        self.delta_nplc_var = tk.StringVar(value="5.0")
+        self.delta_nplc_var = tk.StringVar(value="1.0")
         ttk.Entry(kdelta, textvariable=self.delta_nplc_var, width=8).grid(
                   row=4, column=1, **pad)
         ttk.Label(kdelta, text="power line cycles (2182A integration time)").grid(
@@ -1047,6 +1092,8 @@ class LoggerApp:
         ttk.Label(cur, text="Temperature:").grid(row=1, column=0, sticky="e", **pad)
         self.temp_lbl = ttk.Label(cur, text="—", font=big, foreground="#0055cc")
         self.temp_lbl.grid(row=1, column=1, sticky="w", **pad)
+        self.rate_lbl = ttk.Label(cur, text="—", font=big, foreground="#0055cc")
+        self.rate_lbl.grid(row=1, column=2, sticky="w", **pad)
         ttk.Label(cur, text="Resistance:").grid(row=2, column=0, sticky="e", **pad)
         self.res_lbl = ttk.Label(cur, text="—", font=big, foreground="#cc3300")
         self.res_lbl.grid(row=2, column=1, sticky="w", **pad)
@@ -1390,6 +1437,7 @@ class LoggerApp:
         self.total_points = 0
         self._redraw()
         self.count_lbl["text"] = "0"
+        self.rate_lbl["text"] = "—"
 
     @staticmethod
     def _plain_format(axis):
@@ -1516,6 +1564,7 @@ class LoggerApp:
                     self.res_hist.append(res)
                     self.total_points += 1
                     self.count_lbl["text"] = str(self.total_points)
+                    self.rate_lbl["text"] = self._fmt_rate(self._cooling_rate())
                     self._redraw()
         except queue.Empty:
             pass
@@ -1532,6 +1581,39 @@ class LoggerApp:
         if abs(res) < 1:
             return f"{res * 1e3:.6f} mΩ"
         return f"{res:.6f} Ω"
+
+    def _cooling_rate(self):
+        """Least-squares dT/dt (K/min) over the last RATE_WINDOW_MIN minutes
+        of temperature history. Display-only -- smooths out point-to-point
+        sensor noise so the number is actually readable; never written to
+        the CSV, which keeps the raw per-point temperature untouched."""
+        if len(self.t_hist) < 2:
+            return None
+        t_now = self.t_hist[-1]
+        xs, ys = [], []
+        for t, temp in zip(self.t_hist, self.temp_hist):
+            if math.isnan(temp):
+                continue
+            if t_now - t <= RATE_WINDOW_MIN:
+                xs.append(t)
+                ys.append(temp)
+        if len(xs) < 2:
+            return None
+        n = len(xs)
+        sum_x = sum(xs)
+        sum_y = sum(ys)
+        sum_xy = sum(x * y for x, y in zip(xs, ys))
+        sum_xx = sum(x * x for x in xs)
+        denom = n * sum_xx - sum_x * sum_x
+        if denom == 0:
+            return None
+        return (n * sum_xy - sum_x * sum_y) / denom  # K per minute
+
+    @staticmethod
+    def _fmt_rate(rate):
+        if rate is None or math.isnan(rate):
+            return "—"
+        return f"{rate:+.4f} K/min"
 
     def _redraw(self):
         self.temp_line.set_data(self.t_hist, self.temp_hist)

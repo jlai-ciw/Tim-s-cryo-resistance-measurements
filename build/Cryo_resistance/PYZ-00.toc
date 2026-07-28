@@ -1,4 +1,4 @@
-("C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+("c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
  'measurements\\build\\Cryo_resistance\\PYZ-00.pyz',
  [('PIL',
    'C:\\Users\\jlai\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\PIL\\__init__.py',

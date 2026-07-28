@@ -1,5 +1,5 @@
 ([('Cryo_resistance.exe',
-   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+   "c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\Cryo_resistance.exe',
    'EXECUTABLE'),
   ('PIL\\_avif.cp314-win_amd64.pyd',
@@ -2838,7 +2838,7 @@
    'C:\\Users\\jlai\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_zstd.pyd',
    'EXTENSION'),
   ('base_library.zip',
-   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+   "c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\base_library.zip',
    'DATA'),
   ('contourpy\\_contourpy.cp314-win_amd64.pyd',
