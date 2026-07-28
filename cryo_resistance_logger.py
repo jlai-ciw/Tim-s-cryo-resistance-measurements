@@ -86,7 +86,7 @@ class Keithley6221:
     def __init__(self, host, delta_current=1e-3, delay=0.002, count=1,
                  nplc=1.0, compliance=10.0, mode="delta", voltage_range=None,
                  filter_type="MOV", filter_window=None, filter_count=10,
-                 simulate=False):
+                 display_on=False, simulate=False):
         self.simulate = simulate
         self._delta_current = delta_current
         self._delay = delay
@@ -97,6 +97,7 @@ class Keithley6221:
         self._voltage_range = voltage_range  # None = autorange; else fixed volts
         self._filter_type = filter_type  # "MOV", "REP", or "OFF"
         self._filter_window = filter_window  # None = unset (device default), else 0-10 %
+        self._display_on = display_on  # 2182A front-panel display; off is faster
         self._filter_count = max(2, int(filter_count))
         self.inst = None
         # Guards every access to self.inst: the GUI thread (mode switches,
@@ -144,7 +145,10 @@ class Keithley6221:
             cmds.append(":SENS:VOLT:AVER:STAT ON")
         else:
             cmds.append(":SENS:VOLT:AVER:STAT OFF")
-        cmds.append(":DISP:ENAB OFF")
+        # Display refresh adds overhead to each measurement cycle; Keithley
+        # recommends disabling it for fastest delta-mode triggering, but it's
+        # optional -- left on here if the user wants to watch live readings.
+        cmds.append(f":DISP:ENAB {'ON' if self._display_on else 'OFF'}")
         if line_sync:
             # Delta mode only: syncs 2182A readings to the AC line to reject
             # line-frequency noise between polarity reversals.
@@ -181,6 +185,11 @@ class Keithley6221:
             self.inst.write('SYST:COMM:SER:SEND ":SENS:VOLT:AVER:STAT ON"')
         else:
             self.inst.write('SYST:COMM:SER:SEND ":SENS:VOLT:AVER:STAT OFF"')
+        time.sleep(0.1)
+
+    def _set_2182a_display(self, display_on):
+        """Push a new display-enable state to an already-connected 2182A."""
+        self.inst.write(f'SYST:COMM:SER:SEND ":DISP:ENAB {"ON" if display_on else "OFF"}"')
         time.sleep(0.1)
 
     def _setup_delta(self):
@@ -250,7 +259,8 @@ class Keithley6221:
 
     def update_delta_settings(self, delta_current=None, delay=None, count=None,
                                nplc=None, compliance=None, voltage_range=_UNSET,
-                               filter_type=None, filter_window=_UNSET, filter_count=None):
+                               filter_type=None, filter_window=_UNSET, filter_count=None,
+                               display_on=None):
         """Push new source/measurement parameters to an already-connected
         instrument, in whichever mode (delta or DC) is currently active.
 
@@ -276,6 +286,8 @@ class Keithley6221:
                 self._filter_window = filter_window
             if filter_count is not None:
                 self._filter_count = max(2, int(filter_count))
+            if display_on is not None:
+                self._display_on = display_on
             return
 
         with self._lock:
@@ -312,6 +324,9 @@ class Keithley6221:
                     # Must happen before re-arming below (SOUR:DELT:ARM) --
                     # filter settings are locked in once delta mode is armed.
                     self._set_2182a_filter(self._filter_type, self._filter_window, self._filter_count)
+                if display_on is not None:
+                    self._display_on = display_on
+                    self._set_2182a_display(display_on)
                 self.inst.write("SOUR:DELT:CAB OFF")
                 self.inst.write("SOUR:DELT:ARM")
                 time.sleep(0.2)
@@ -338,6 +353,9 @@ class Keithley6221:
                     if filter_count is not None:
                         self._filter_count = max(2, int(filter_count))
                     self._set_2182a_filter(self._filter_type, self._filter_window, self._filter_count)
+                if display_on is not None:
+                    self._display_on = display_on
+                    self._set_2182a_display(display_on)
 
     def _flush(self):
         """Drain any unread bytes left in the socket receive buffer."""
@@ -817,10 +835,17 @@ class LoggerApp:
         ttk.Label(kdelta, text="readings averaged (2-100)").grid(
                   row=10, column=2, sticky="w")
 
+        self.display_on_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(kdelta, text="Keep 2182A display on",
+                        variable=self.display_on_var).grid(row=11, column=0,
+                                                             sticky="w", **pad)
+        ttk.Label(kdelta, text="slightly slower delta-mode triggering").grid(
+                  row=11, column=2, sticky="w")
+
         self.apply_delta_btn = ttk.Button(kdelta, text="Apply to instrument",
                                           command=self.apply_delta_settings,
                                           state="disabled")
-        self.apply_delta_btn.grid(row=11, column=0, columnspan=3, **pad)
+        self.apply_delta_btn.grid(row=12, column=0, columnspan=3, **pad)
 
         # --- Keithley 2400 source settings ---
         k2400 = ttk.LabelFrame(conn, text="Keithley 2400 — Source Settings")
@@ -1082,6 +1107,7 @@ class LoggerApp:
                                              filter_type=FILTER_TYPES[self.filter_type_var.get()],
                                              filter_window=filter_window,
                                              filter_count=filter_count,
+                                             display_on=self.display_on_var.get(),
                                              simulate=self.simulate_keithley_var.get())
                 k_id = self.keithley.identify()
             else:
@@ -1157,7 +1183,8 @@ class LoggerApp:
                 delta_current=delta_current, delay=delta_delay,
                 count=delta_count, nplc=delta_nplc, compliance=compliance,
                 voltage_range=voltage_range, filter_type=filter_type,
-                filter_window=filter_window, filter_count=filter_count)
+                filter_window=filter_window, filter_count=filter_count,
+                display_on=self.display_on_var.get())
         except Exception as e:
             messagebox.showerror("Apply failed", str(e))
             self.status_var.set(f"Failed to apply delta settings: {e}")
