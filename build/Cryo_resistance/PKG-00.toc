@@ -1,4 +1,4 @@
-("U:\\Dell backup 2026\\.claude\\projects\\Tim's cryo resistance "
+("C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
  'measurements\\build\\Cryo_resistance\\Cryo_resistance.pkg',
  {'BINARY': True,
   'DATA': True,
@@ -11,27 +11,27 @@
   'SYMLINK': False},
  [('pyi-contents-directory _internal', '', 'OPTION'),
   ('PYZ-00.pyz',
-   "U:\\Dell backup 2026\\.claude\\projects\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\PYZ-00.pyz',
    'PYZ'),
   ('struct',
-   "U:\\Dell backup 2026\\.claude\\projects\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\struct.pyc',
    'PYMODULE'),
   ('pyimod01_archive',
-   "U:\\Dell backup 2026\\.claude\\projects\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\pyimod01_archive.pyc',
    'PYMODULE'),
   ('pyimod02_importers',
-   "U:\\Dell backup 2026\\.claude\\projects\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\pyimod02_importers.pyc',
    'PYMODULE'),
   ('pyimod03_ctypes',
-   "U:\\Dell backup 2026\\.claude\\projects\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\pyimod03_ctypes.pyc',
    'PYMODULE'),
   ('pyimod04_pywin32',
-   "U:\\Dell backup 2026\\.claude\\projects\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\pyimod04_pywin32.pyc',
    'PYMODULE'),
   ('pyiboot01_bootstrap',
@@ -53,8 +53,7 @@
    'C:\\Users\\jlai\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth__tkinter.py',
    'PYSOURCE'),
   ('cryo_resistance_logger',
-   '\\\\epl-scidata.ad.ciw.edu\\users\\jlai\\Dell backup '
-   "2026\\.claude\\projects\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\cryo_resistance_logger.py',
    'PYSOURCE')],
  'python314.dll',
