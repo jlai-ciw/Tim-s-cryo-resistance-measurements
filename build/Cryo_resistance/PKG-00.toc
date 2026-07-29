@@ -1,4 +1,4 @@
-("c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+("C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
  'measurements\\build\\Cryo_resistance\\Cryo_resistance.pkg',
  {'BINARY': True,
   'DATA': True,
@@ -11,27 +11,27 @@
   'SYMLINK': False},
  [('pyi-contents-directory _internal', '', 'OPTION'),
   ('PYZ-00.pyz',
-   "c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\PYZ-00.pyz',
    'PYZ'),
   ('struct',
-   "c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\struct.pyc',
    'PYMODULE'),
   ('pyimod01_archive',
-   "c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\pyimod01_archive.pyc',
    'PYMODULE'),
   ('pyimod02_importers',
-   "c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\pyimod02_importers.pyc',
    'PYMODULE'),
   ('pyimod03_ctypes',
-   "c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\pyimod03_ctypes.pyc',
    'PYMODULE'),
   ('pyimod04_pywin32',
-   "c:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
+   "C:\\Users\\jlai\\Documents\\python\\Strobel\\Tim's cryo resistance "
    'measurements\\build\\Cryo_resistance\\localpycs\\pyimod04_pywin32.pyc',
    'PYMODULE'),
   ('pyiboot01_bootstrap',

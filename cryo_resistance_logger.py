@@ -16,6 +16,8 @@ import math
 import os
 import queue
 import random
+import socket
+import struct
 import threading
 import time
 import tkinter as tk
@@ -137,10 +139,15 @@ class Keithley6221:
             return
         with self._lock:
             if self.inst is not None:
+                # Best-effort tidy exit out of delta mode so the instrument
+                # isn't left with a sweep running against a socket that's
+                # about to disappear. Fails harmlessly if the link is dead.
                 try:
-                    self.inst.close()
+                    self.inst.write("SOUR:SWE:ABOR")
+                    time.sleep(0.1)
                 except Exception:
                     pass
+                self._abortive_close()
                 self.inst = None
             # The 6221's embedded network stack only accepts one client on
             # port 1394 at a time and can take a couple of seconds to notice
@@ -152,6 +159,35 @@ class Keithley6221:
                 self._setup_delta()
             else:
                 self._setup_dc()
+
+    def _abortive_close(self):
+        """Close the VISA session, preferring an abortive (RST) close over a
+        graceful (FIN) one.
+
+        A graceful close relies on the 6221 processing the FIN to free its
+        single port-1394 slot -- exactly what it fails to do when its SCPI
+        parser is wedged, which is how the instrument ends up refusing every
+        reconnect until it's power cycled. SO_LINGER with a zero timeout
+        makes the OS send RST instead, which tears the connection down at
+        the TCP layer without needing cooperation from the instrument's
+        application layer.
+
+        Reaching the underlying socket is pyvisa-py-specific and unsupported
+        API, so this is entirely best-effort: any failure just falls through
+        to the ordinary close()."""
+        try:
+            session = self.inst.visalib.sessions[self.inst.session]
+            sock = getattr(session, "interface", None)
+            if sock is not None:
+                # linger onoff=1, timeout=0 -> abortive close (RST)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack("ii", 1, 0))
+        except Exception:
+            pass
+        try:
+            self.inst.close()
+        except Exception:
+            pass
 
     def _configure_2182a(self, line_sync=False):
         """Configure the 2182A via the 6221's RS-232 pass-through port.
@@ -423,9 +459,17 @@ class Keithley6221:
             return True
         try:
             with self._lock:
-                self._flush()
-                self.inst.write("*CLS")
-                return bool(self.inst.query("*IDN?").strip())
+                old_to = self.inst.timeout
+                # A liveness check must fail fast -- at the normal 30 s read
+                # timeout, probing a genuinely dead link would stall the
+                # logging loop for half a minute on every cycle.
+                self.inst.timeout = 3000
+                try:
+                    self._flush()
+                    self.inst.write("*CLS")
+                    return bool(self.inst.query("*IDN?").strip())
+                finally:
+                    self.inst.timeout = old_to
         except Exception:
             return False
 
@@ -455,8 +499,16 @@ class Keithley6221:
                 return float("nan")
             return voltage / self._delta_current
         except Exception:
-            # Delta mode may have been aborted — flush stale data, re-arm
+            # Delta mode may still be armed/running — flush stale data, then
+            # abort before re-arming. Per the manual, arming while Delta is
+            # already running returns "Error -221 Settings Conflict" and the
+            # re-arm silently doesn't take, leaving the instrument wedged in
+            # a state that only a power cycle clears; SOUR:SWE:ABOR is the
+            # documented way to exit Delta mode, and a sweep must be re-armed
+            # after an abort anyway.
             self._flush()
+            self.inst.write("SOUR:SWE:ABOR")
+            time.sleep(0.2)
             self.inst.write("*CLS")
             self.inst.write("SOUR:DELT:ARM")
             time.sleep(1.0)
@@ -492,6 +544,14 @@ class Keithley6221:
     def close(self):
         with self._lock:
             if self.inst is not None:
+                # Drop the timeout before the courtesy shutdown writes: if
+                # the link is already dead these would otherwise each block
+                # for the full 30 s read timeout, which is what made
+                # Disconnect hang and report VI_ERROR_TMO after a drop.
+                try:
+                    self.inst.timeout = 2000
+                except Exception:
+                    pass
                 try:
                     self.inst.write("SOUR:SWE:ABOR")
                     time.sleep(0.1)
@@ -501,10 +561,7 @@ class Keithley6221:
                     self.inst.write("OUTP OFF")
                 except Exception:
                     pass
-                try:
-                    self.inst.close()
-                except Exception:
-                    pass
+                self._abortive_close()
                 self.inst = None
 
 
@@ -792,6 +849,17 @@ class Cryocon22C:
 
 MAX_PLOT_POINTS = 5000  # cap in-memory/plotted history; full data always still goes to the CSV
 
+MIN_REDRAW_INTERVAL = 1.0  # seconds; floor on time between plot redraws.
+                            # Redrawing three axes of up to MAX_PLOT_POINTS is
+                            # the most expensive thing the GUI thread does, and
+                            # on slow hardware doing it per reading starves the
+                            # interpreter of time for the logging thread's I/O.
+
+MARKER_POINT_LIMIT = 500   # above this many points, drop the per-point markers
+                            # and draw plain lines -- rasterizing thousands of
+                            # individual markers dominates redraw cost, and they
+                            # are unreadable at that density anyway.
+
 RATE_WINDOW_MIN = 2.0  # minutes of recent history used for the displayed
                         # cooling-rate estimate (display-only, never logged)
 
@@ -815,6 +883,9 @@ class LoggerApp:
         self.res_hist = deque(maxlen=MAX_PLOT_POINTS)
         self.total_points = 0
         self.start_time = None
+        self._last_redraw = 0.0
+        self._markers_on = True
+        self._pending_redraw = False
 
         self._build_gui()
         self.refresh_resources()
@@ -1124,7 +1195,7 @@ class LoggerApp:
         def _range_row(row, label, auto_var, min_var, max_var):
             ttk.Label(rng, text=label).grid(row=row, column=0, sticky="e", **pad)
             ttk.Checkbutton(rng, text="Auto", variable=auto_var,
-                             command=self._redraw).grid(row=row, column=1, sticky="w")
+                             command=self._force_redraw).grid(row=row, column=1, sticky="w")
             f = ttk.Frame(rng)
             f.grid(row=row, column=2, sticky="w", **pad)
             e_min = ttk.Entry(f, textvariable=min_var, width=8)
@@ -1132,13 +1203,13 @@ class LoggerApp:
             ttk.Label(f, text=" to ").pack(side="left")
             e_max = ttk.Entry(f, textvariable=max_var, width=8)
             e_max.pack(side="left")
-            e_min.bind("<Return>", lambda e: self._redraw())
-            e_max.bind("<Return>", lambda e: self._redraw())
+            e_min.bind("<Return>", lambda e: self._force_redraw())
+            e_max.bind("<Return>", lambda e: self._force_redraw())
 
         _range_row(0, "Temperature (K):", self.temp_auto_var, self.temp_min_var, self.temp_max_var)
         _range_row(1, "Resistance (Ω):", self.res_auto_var, self.res_min_var, self.res_max_var)
         _range_row(2, "Elapsed time (min):", self.time_auto_var, self.time_min_var, self.time_max_var)
-        ttk.Button(rng, text="Apply ranges", command=self._redraw).grid(
+        ttk.Button(rng, text="Apply ranges", command=self._force_redraw).grid(
             row=3, column=0, columnspan=3, **pad)
 
         # --- Current readings frame ---
@@ -1494,7 +1565,7 @@ class LoggerApp:
         self.temp_hist.clear()
         self.res_hist.clear()
         self.total_points = 0
-        self._redraw()
+        self._redraw(force=True)
         self.count_lbl["text"] = "0"
         self.rate_lbl["text"] = "—"
 
@@ -1520,7 +1591,7 @@ class LoggerApp:
             # re-applied; log scale keeps matplotlib's own power-of-ten labels.
             self._plain_format(self.ax_rt.yaxis)
             self._plain_format(self.ax_res.yaxis)
-        self._redraw()
+        self._redraw(force=True)
 
     @staticmethod
     def _parse_range(min_var, max_var):
@@ -1626,6 +1697,7 @@ class LoggerApp:
 
     # ------------------------------------------------------------ GUI update
     def _poll_queue(self):
+        got_data = False
         try:
             while True:
                 msg = self.data_queue.get_nowait()
@@ -1645,9 +1717,16 @@ class LoggerApp:
                     self.total_points += 1
                     self.count_lbl["text"] = str(self.total_points)
                     self.rate_lbl["text"] = self._fmt_rate(self._cooling_rate())
-                    self._redraw()
+                    got_data = True
         except queue.Empty:
             pass
+        # Redraw once per poll cycle rather than once per queued point --
+        # if several points ever pile up in one pass (e.g. after a stall),
+        # each matplotlib redraw touches up to MAX_PLOT_POINTS across 3
+        # axes, so redrawing per-point can make the GUI fall further and
+        # further behind instead of catching back up.
+        if got_data:
+            self._redraw()
         self.root.after(200, self._poll_queue)
 
     @staticmethod
@@ -1671,12 +1750,17 @@ class LoggerApp:
             return None
         t_now = self.t_hist[-1]
         xs, ys = [], []
-        for t, temp in zip(self.t_hist, self.temp_hist):
+        # Walk backward from the newest point instead of scanning the whole
+        # (up to MAX_PLOT_POINTS-long) history forward each time -- t_hist is
+        # monotonically increasing, so once a point falls outside the window
+        # every older point will too, and it's safe to stop right there.
+        for t, temp in zip(reversed(self.t_hist), reversed(self.temp_hist)):
+            if t_now - t > RATE_WINDOW_MIN:
+                break
             if math.isnan(temp):
                 continue
-            if t_now - t <= RATE_WINDOW_MIN:
-                xs.append(t)
-                ys.append(temp)
+            xs.append(t)
+            ys.append(temp)
         if len(xs) < 2:
             return None
         n = len(xs)
@@ -1695,7 +1779,22 @@ class LoggerApp:
             return "—"
         return f"{rate:+.4f} K/min"
 
-    def _redraw(self):
+    def _redraw(self, force=False):
+        """Refresh both figures. Rate-limited to MIN_REDRAW_INTERVAL unless
+        forced (e.g. by an explicit user action like Apply ranges or Clear),
+        so a fast logging interval can't peg the GUI thread redrawing faster
+        than anyone can read. A skipped redraw is retried shortly after
+        rather than dropped, so the plots never sit stale."""
+        now = time.time()
+        if not force and now - self._last_redraw < MIN_REDRAW_INTERVAL:
+            if not self._pending_redraw:
+                self._pending_redraw = True
+                delay_ms = int(MIN_REDRAW_INTERVAL * 1000)
+                self.root.after(delay_ms, self._redraw_pending)
+            return
+        self._last_redraw = now
+        self._pending_redraw = False
+        self._apply_marker_style()
         self.temp_line.set_data(self.t_hist, self.temp_hist)
         self.res_line.set_data(self.t_hist, self.res_hist)
         for ax in (self.ax_temp, self.ax_res):
@@ -1729,6 +1828,29 @@ class LoggerApp:
             if r:
                 self.ax_rt.set_ylim(*r)
         self.canvas_rt.draw_idle()
+
+    def _force_redraw(self):
+        """Redraw immediately, bypassing the rate limit -- for direct user
+        actions (Apply ranges, Auto toggles) that should feel instant."""
+        self._redraw(force=True)
+
+    def _redraw_pending(self):
+        """Deferred redraw scheduled when one was throttled away."""
+        if self._pending_redraw:
+            self._pending_redraw = False
+            self._redraw(force=True)
+
+    def _apply_marker_style(self):
+        """Show per-point markers only while the plots are sparse enough for
+        them to mean anything; past MARKER_POINT_LIMIT they merge into a
+        solid smear and cost far more to rasterize than the line itself."""
+        want_markers = len(self.t_hist) <= MARKER_POINT_LIMIT
+        if want_markers == self._markers_on:
+            return
+        self._markers_on = want_markers
+        marker = "." if want_markers else "None"
+        for line in (self.temp_line, self.res_line, self.rt_line):
+            line.set_marker(marker)
 
     def on_close(self):
         self.stop_logging()
